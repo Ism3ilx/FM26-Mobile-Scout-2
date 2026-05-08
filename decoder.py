@@ -1,93 +1,120 @@
 """
-decoder.py – فك تشفير ملف حفظ FM26 Mobile (يدعم SQLite)
+decoder.py – فك تشفير ملف حفظ FM26 Mobile
+يستخدم طريقة مسح الملف بايت بايت للبحث عن نصوص بطول مسبوق (Length-Prefixed)
+ثم استخراج أسماء اللاعبين والإحصائيات القريبة.
 """
-import sqlite3
+import struct
 import pandas as pd
-from io import BytesIO
 
 def extract_players_from_save(file_bytes: bytes) -> pd.DataFrame:
     """
-    يحاول فتح ملف الحفظ كقاعدة بيانات SQLite،
-    ثم يستخرج بيانات اللاعبين ويعيدها كـ DataFrame.
-    إذا فشل، يعيد DataFrame فارغ مع رسالة خطأ.
+    يمسح الملف بالكامل، يبحث عن نصوص بطول مسبوق،
+    يحلل الأسماء المحتملة للاعبين ويستخرج العمر، CA، PA.
     """
-    try:
-        # فتح الملف كقاعدة بيانات في الذاكرة
-        db_file = BytesIO(file_bytes)
-        conn = sqlite3.connect(db_file)
+    offset = 0
+    players_raw = []
+    excl = {s.lower() for s in [
+        'stadium', 'league', 'cup', 'madrid', 'arena', 'park', 'centre',
+        'club', 'city', 'united', 'town', 'county', 'division', 'group',
+        'round', 'final', 'cup', 'trophy', 'international', 'super', 'first',
+        'second', 'third', 'premier', 'championship', 'qualifying', 'team',
+        'national', 'world', 'european', 'african', 'asian', 'cup', 'game',
+        'match', 'season', 'transfer', 'window', 'manager', 'coach', 'format',
+        'rules', 'system', 'data', 'version', 'staging', 'rel', 'fmm', 'fm',
+    ]}
 
-        # التحقق من وجود جداول
-        tables_query = "SELECT name FROM sqlite_master WHERE type='table';"
-        tables = pd.read_sql_query(tables_query, conn)
-        table_names = tables["name"].tolist()
-        print("📋 الجداول الموجودة:", table_names)
-
-        # البحث عن جدول اللاعبين (أسماء شائعة في إصدارات FM)
-        player_table = None
-        for candidate in ["player", "players", "people", "player_data", "staff"]:
-            if candidate in table_names:
-                player_table = candidate
+    while offset < len(file_bytes) - 4:
+        try:
+            # قراءة الطول
+            str_len = struct.unpack_from('<I', file_bytes, offset)[0]
+            if str_len < 3 or str_len > 100:  # طول غير منطقي لاسم
+                offset += 1
+                continue
+            offset += 4
+            if offset + str_len > len(file_bytes):
                 break
 
-        if player_table is None:
-            # إذا لم نجد جدولًا معروفًا، نعرض كل الجداول للمستخدم
-            conn.close()
-            error_msg = (
-                f"⚠️ لم يتم العثور على جدول اللاعبين في الملف.\n"
-                f"الجداول الموجودة: {table_names}\n\n"
-                f"يرجى فتح الملف باستخدام DB Browser for SQLite "
-                f"ومعرفة اسم جدول اللاعبين يدويًا، ثم تعديل الكود."
-            )
-            print(error_msg)
-            return pd.DataFrame({"خطأ": [error_msg]})
+            # قراءة النص
+            raw = file_bytes[offset:offset+str_len]
+            try:
+                string_val = raw.decode('utf-8')
+            except:
+                offset += str_len
+                continue
+            offset += str_len
 
-        # قراءة بيانات اللاعبين
-        df = pd.read_sql_query(f"SELECT * FROM {player_table}", conn)
-        conn.close()
+            # هل يشبه اسم لاعب؟
+            words = string_val.strip().split()
+            if not (1 <= len(words) <= 6):
+                continue
+            if not any(c.isalpha() for c in string_val):
+                continue
+            if any(w.lower() in excl for w in words):
+                continue
+            # يجب أن يحتوي على حروف كبيرة وصغيرة
+            if not string_val[0].isupper():
+                continue
 
-        if df.empty:
-            return pd.DataFrame({"تنبيه": ["جدول اللاعبين موجود لكنه فارغ."]})
+            # ربما لاعب - اقرأ 50 بايت التالية للبحث عن أرقام
+            stat_start = offset
+            stat_end = min(offset + 50, len(file_bytes))
+            stat_bytes = file_bytes[stat_start:stat_end]
 
-        print(f"✅ تم استخراج {len(df)} لاعبًا من جدول '{player_table}'.")
-        return _normalize_columns(df)
+            # استخراج كل القيم الصحيحة بين 1-200 (مرشحة لتكون CA/PA)
+            candidates = []
+            for i in range(0, len(stat_bytes)):
+                val = stat_bytes[i]
+                if 1 <= val <= 200:
+                    # تحقق من أن البايت التالي أو السابق يساعد في كونه قيمة مفردة
+                    if i+1 < len(stat_bytes) and stat_bytes[i+1] == 0:
+                        candidates.append(val)
+                    elif i-1 >= 0 and stat_bytes[i-1] == 0:
+                        candidates.append(val)
+                    else:
+                        candidates.append(val)  # نقبله بصعوبة
 
-    except sqlite3.DatabaseError:
-        # الملف ليس قاعدة بيانات SQLite
-        error_msg = (
-            "❌ هذا الملف ليس قاعدة بيانات SQLite.\n"
-            "قد يكون مضغوطًا أو مشفرًا أو بتنسيق غير معروف.\n"
-            "حاول فتح الملف بأداة Hex Editor لفحص الترويسة."
-        )
-        print(error_msg)
-        return pd.DataFrame({"خطأ": [error_msg]})
-    except Exception as e:
-        print(f"❌ خطأ غير متوقع: {e}")
-        return pd.DataFrame({"خطأ": [str(e)]})
+            if len(candidates) < 2:
+                continue
 
+            ca = candidates[0] if 100 <= candidates[0] <= 200 else None
+            pa = candidates[1] if 100 <= candidates[1] <= 200 else None
 
-def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    يعيد تسمية الأعمدة الإنجليزية إلى العربية المطلوبة للتطبيق.
-    يقبل فقط الأعمدة الموجودة فعلًا في قاعدة البيانات.
-    """
-    column_map = {
-        # أسماء أعمدة شائعة في إصدارات FM
-        "name": "الاسم",
-        "first_name": "الاسم",
-        "age": "العمر",
-        "nationality": "الجنسية",
-        "club": "النادي",
-        "position": "المركز",
-        "current_ability": "CA",
-        "potential_ability": "PA",
-        "value": "القيمة السوقية (€)",
-        "wage": "الراتب (€/أسبوع)",
-        "contract_expiry": "مدة العقد (سنوات)",
-        "goals": "الأهداف",
-        "assists": "التمريرات الحاسمة",
-        "average_rating": "التقييم",
-    }
-    # إعادة تسمية الأعمدة الموجودة فقط
-    rename_dict = {k: v for k, v in column_map.items() if k in df.columns}
-    df = df.rename(columns=rename_dict)
+            # محاولة استخراج العمر من البايتات حول الـ CA/PA
+            age = None
+            for j in range(0, len(stat_bytes)):
+                val = stat_bytes[j]
+                if 15 <= val <= 45:
+                    # تحقق من أن البايت التالي صفر غالباً (علامة على عمر منفرد)
+                    if j+1 < len(stat_bytes) and stat_bytes[j+1] == 0:
+                        age = val
+                        break
+
+            if ca is not None and pa is not None and age is not None:
+                players_raw.append({
+                    "الاسم": string_val.strip(),
+                    "العمر": age,
+                    "CA": ca,
+                    "PA": pa,
+                })
+        except:
+            offset += 1
+
+    # إزالة التكرارات
+    seen = set()
+    unique = []
+    for p in players_raw:
+        key = (p["الاسم"], p["العمر"])
+        if key not in seen:
+            seen.add(key)
+            unique.append(p)
+
+    if not unique:
+        return pd.DataFrame({"خطأ": ["لم يتم العثور على لاعبين بهذه الطريقة."]})
+
+    df = pd.DataFrame(unique)
+    # إضافة الأعمدة المفقودة لتجنب رسالة التحذير
+    for col in ["الجنسية", "النادي", "المركز", "القيمة السوقية (€)",
+                "الراتب (€/أسبوع)", "مدة العقد (سنوات)", "الأهداف", "التمريرات الحاسمة", "التقييم"]:
+        if col not in df.columns:
+            df[col] = ""
     return df
