@@ -61,7 +61,7 @@ def main():
     st.markdown("ارفع ملف الحفظ (`.dat`, `.sav`) لاستعراض وتحليل اللاعبين.")
 
     # رفع الملف
-    uploaded_file = st.file_uploader("اختر ملف الحفظ", type=["dat","sav","bin",""], help="ملف save.dat الخاص بلعبة FM26 Mobile")
+    uploaded_file = st.file_uploader("اختر ملف الحفظ", type=["dat","sav","bin","fms"], help="ملف save.dat الخاص بلعبة FM26 Mobile")
     use_demo = st.checkbox("🔮 استخدام بيانات تجريبية للعرض", value=not uploaded_file)
 
     if uploaded_file or use_demo:
